@@ -28,7 +28,7 @@ class MockModel:
     This ensures that with temperature > 0, different samples should
     (with very high probability) produce different tokens.
     """
-    def __init__(self, vocab_size=262):  # 256 bytes + 6 special tokens
+    def __init__(self, vocab_size=263):  # 256 bytes + 7 special tokens
         self.vocab_size = vocab_size
         self.config = MockConfig()
         self._device = torch.device("cpu")
@@ -55,20 +55,25 @@ class ByteTokenizer:
     def __init__(self):
         # Special tokens start at 256
         self._special_tokens = {
-            "<|python_start|>": 256,
-            "<|python_end|>": 257,
-            "<|output_start|>": 258,
-            "<|output_end|>": 259,
-            "<|assistant_end|>": 260,
-            "<|bos|>": 261,
+            "python_start": 256,
+            "python_end": 257,
+            "output_start": 258,
+            "output_end": 259,
+            "assistant_end": 260,
+            "document_start": 261,
+            "eos": 262,
         }
-        self._bos = 261
+        self._document_start = 261
+        self._eos = 262
 
-    def encode_special(self, s):
-        return self._special_tokens[s]
+    def get_chat_token_id(self, name):
+        return self._special_tokens[name]
 
-    def get_bos_token_id(self):
-        return self._bos
+    def get_document_start_token_id(self):
+        return self._document_start
+
+    def get_eos_token_id(self):
+        return self._eos
 
     def encode(self, s, prepend=None):
         tokens = list(s.encode("utf-8"))  # bytes 0-255
@@ -164,16 +169,16 @@ def test_multi_sample_first_token_diversity():
     rows, causing all samples to start identically. The fix expands the prefill logits
     to num_samples and samples independently for each row.
 
-    With uniform logits over 262 tokens and 16 samples, the probability that all
-    samples independently pick the same token is (1/262)^15 ≈ 10^-36. So if they're
+    With uniform logits over 263 tokens and 16 samples, the probability that all
+    samples independently pick the same token is (1/263)^15 ≈ 10^-36. So if they're
     all identical, it indicates tokens are being broadcast instead of independently sampled.
     """
-    model = MockModel(vocab_size=262)
+    model = MockModel(vocab_size=263)
     tokenizer = ByteTokenizer()
     engine = Engine(model, tokenizer)
 
     # Generate 16 samples with temperature=1.0 (stochastic sampling)
-    prompt_tokens = [261, 72, 101, 108, 108, 111]  # <bos> + "Hello"
+    prompt_tokens = [261, 72, 101, 108, 108, 111]  # document_start + "Hello"
     num_samples = 16
 
     # Collect the first generated token from each sample
@@ -202,7 +207,7 @@ def test_seed_reproducibility():
     """Same seed must produce identical output."""
     model = MockModel()
     engine = Engine(model, ByteTokenizer())
-    prompt = [261, 72, 101, 108, 108, 111]  # <bos> + "Hello"
+    prompt = [261, 72, 101, 108, 108, 111]  # document_start + "Hello"
 
     for seed in [1, 42, 123, 999]:
         r1, _ = engine.generate_batch(prompt, max_tokens=5, seed=seed)
@@ -250,7 +255,7 @@ def test_different_seeds_introduce_variation_when_temperature_nonzero():
     """With temperature > 0, different seeds should introduce sampling variation."""
     model = MockModel()
     engine = Engine(model, ByteTokenizer())
-    prompt = [261, 72, 101, 108, 108, 111]  # <bos> + "Hello"
+    prompt = [261, 72, 101, 108, 108, 111]  # document_start + "Hello"
 
     outputs = set()
 

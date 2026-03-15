@@ -264,8 +264,9 @@ async def generate_stream(
     max_new_tokens = max_new_tokens if max_new_tokens is not None else args.max_tokens
     top_k = top_k if top_k is not None else args.top_k
 
-    assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
-    bos = worker.tokenizer.get_bos_token_id()
+    assistant_end = worker.tokenizer.get_chat_token_id("assistant_end")
+    eos = worker.tokenizer.get_eos_token_id()
+    document_start = worker.tokenizer.get_document_start_token_id()
 
     # Accumulate tokens to properly handle multi-byte UTF-8 characters (like emojis)
     accumulated_tokens = []
@@ -283,7 +284,7 @@ async def generate_stream(
         token = token_column[0]
 
         # Stopping criteria
-        if token == assistant_end or token == bos:
+        if token in {assistant_end, eos, document_start}:
             break
 
         # Append the token to sequence
@@ -320,25 +321,13 @@ async def chat_completions(request: ChatRequest):
     worker = await worker_pool.acquire_worker()
 
     try:
-        # Build conversation tokens
-        bos = worker.tokenizer.get_bos_token_id()
-        user_start = worker.tokenizer.encode_special("<|user_start|>")
-        user_end = worker.tokenizer.encode_special("<|user_end|>")
-        assistant_start = worker.tokenizer.encode_special("<|assistant_start|>")
-        assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
-
-        conversation_tokens = [bos]
-        for message in request.messages:
-            if message.role == "user":
-                conversation_tokens.append(user_start)
-                conversation_tokens.extend(worker.tokenizer.encode(message.content))
-                conversation_tokens.append(user_end)
-            elif message.role == "assistant":
-                conversation_tokens.append(assistant_start)
-                conversation_tokens.extend(worker.tokenizer.encode(message.content))
-                conversation_tokens.append(assistant_end)
-
-        conversation_tokens.append(assistant_start)
+        prompt_conversation = {
+            "messages": [
+                {"role": message.role, "content": message.content}
+                for message in request.messages
+            ] + [{"role": "assistant", "content": ""}]
+        }
+        conversation_tokens = worker.tokenizer.render_for_completion(prompt_conversation)
 
         # Streaming response with worker release after completion
         response_tokens = []

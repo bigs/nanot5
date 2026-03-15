@@ -17,7 +17,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
 
     The added complexity is so that:
     1) All "normal" tokens are normalized by the length of the token in bytes
-    2) No special tokens (e.g. <|bos|>) are included in the metric - they are masked out.
+    2) No special tokens are included in the metric - they are masked out.
     3) No actively masked tokens (using ignore_index of e.g. -1) are included in the metric.
 
     In addition to evaluate_loss, we need the token_bytes tensor:

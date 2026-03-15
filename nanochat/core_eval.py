@@ -112,7 +112,7 @@ def stack_sequences(tokens, pad_token_id):
 
 def batch_sequences_mc(tokenizer, prompts):
     # In multiple choice, contexts are the same but the continuation is different (common prefix)
-    tokens = tokenizer(prompts, prepend=tokenizer.get_bos_token_id())
+    tokens = tokenizer(prompts, prepend=tokenizer.get_document_start_token_id())
     # figure out the start and end of each continuation
     answer_start_idx = find_common_length(tokens, direction='left')
     start_indices = [answer_start_idx] * len(prompts)
@@ -122,7 +122,7 @@ def batch_sequences_mc(tokenizer, prompts):
 
 def batch_sequences_schema(tokenizer, prompts):
     # In schema tasks, contexts vary but continuation is the same (common suffix)
-    tokens = tokenizer(prompts, prepend=tokenizer.get_bos_token_id())
+    tokens = tokenizer(prompts, prepend=tokenizer.get_document_start_token_id())
     # figure out the start and end of each context
     suffix_length = find_common_length(tokens, direction='right')
     end_indices = [len(x) for x in tokens]
@@ -132,7 +132,7 @@ def batch_sequences_schema(tokenizer, prompts):
 
 def batch_sequences_lm(tokenizer, prompts):
     # In LM tasks, we have two prompts: without and with continuation
-    tokens = tokenizer(prompts, prepend=tokenizer.get_bos_token_id())
+    tokens = tokenizer(prompts, prepend=tokenizer.get_document_start_token_id())
     tokens_without, tokens_with = tokens
     start_idx, end_idx = len(tokens_without), len(tokens_with)
     assert start_idx < end_idx, "prompt without is supposed to be a prefix of prompt with"
@@ -213,7 +213,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         tokens, start_idxs, end_idxs = new_tokens, new_start_idxs, new_end_idxs
 
     # Stack up all the sequences into a batch
-    pad_token_id = tokenizer.get_bos_token_id() # use BOS as pad token is ok
+    pad_token_id = tokenizer.get_pad_token_id()
     input_ids = stack_sequences(tokens, pad_token_id)
     input_ids = input_ids.to(device)
 

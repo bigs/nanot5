@@ -186,9 +186,9 @@ approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
 current_epoch = 1 # track epoch for logging
 def sft_data_generator_bos_bestfit(split, buffer_size=100):
     """
-    BOS-aligned dataloader for SFT with bestfit-pad packing.
+    Document-start aligned dataloader for SFT with bestfit-pad packing.
 
-    Each row in the batch starts with BOS (beginning of a conversation).
+    Each row in the batch starts with the tokenizer's document-start token.
     Conversations are packed using best-fit algorithm. When no conversation fits,
     the row is padded (instead of cropping) to ensure no tokens are ever discarded.
     Padding positions have targets masked with -1 (ignore_index for cross-entropy).
@@ -199,7 +199,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     dataset_size = len(dataset)
     assert dataset_size > 0
     row_capacity = args.max_seq_len + 1  # +1 for target at last position
-    bos_token = tokenizer.get_bos_token_id()
+    pad_token = tokenizer.get_pad_token_id()
 
     # Conversation buffer: list of (token_ids, loss_mask) tuples
     conv_buffer = []
@@ -254,7 +254,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     # No conversation fits - pad the remainder instead of cropping
                     # This ensures we never discard any tokens
                     content_len = len(row)
-                    row.extend([bos_token] * remaining)  # Pad with BOS tokens
+                    row.extend([pad_token] * remaining)
                     mask_row.extend([0] * remaining)
                     padded = True
                     break  # Row is now full (with padding)
@@ -290,7 +290,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
 
         # Apply the loss mask from render_conversation (mask=1 for assistant completions,
-        # mask=0 for user prompts, BOS, special tokens, tool outputs). mask[1:] aligns
+        # mask=0 for user prompts, document-start, special tokens, tool outputs). mask[1:] aligns
         # with targets (shifted by 1). Unmasked positions get -1 (ignore_index).
         mask_tensor = torch.tensor(mask_rows, dtype=torch.int8)
         mask_targets = mask_tensor[:, 1:].to(device=device)

@@ -26,11 +26,6 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
 
-# Special tokens for the chat state machine
-bos = tokenizer.get_bos_token_id()
-user_start, user_end = tokenizer.encode_special("<|user_start|>"), tokenizer.encode_special("<|user_end|>")
-assistant_start, assistant_end = tokenizer.encode_special("<|assistant_start|>"), tokenizer.encode_special("<|assistant_end|>")
-
 # Create Engine for efficient generation
 engine = Engine(model, tokenizer)
 
@@ -40,7 +35,7 @@ print("Type 'quit' or 'exit' to end the conversation")
 print("Type 'clear' to start a new conversation")
 print("-" * 50)
 
-conversation_tokens = [bos]
+conversation = {"messages": []}
 
 while True:
 
@@ -61,20 +56,16 @@ while True:
         break
 
     if user_input.lower() == 'clear':
-        conversation_tokens = [bos]
+        conversation = {"messages": []}
         print("Conversation cleared.")
         continue
 
     if not user_input:
         continue
 
-    # Add User message to the conversation
-    conversation_tokens.append(user_start)
-    conversation_tokens.extend(tokenizer.encode(user_input))
-    conversation_tokens.append(user_end)
-
-    # Kick off the assistant
-    conversation_tokens.append(assistant_start)
+    conversation["messages"].append({"role": "user", "content": user_input})
+    prompt_conversation = {"messages": conversation["messages"] + [{"role": "assistant", "content": ""}]}
+    prompt_tokens = tokenizer.render_for_completion(prompt_conversation)
     generate_kwargs = {
         "num_samples": 1,
         "max_tokens": 256,
@@ -83,17 +74,13 @@ while True:
     }
     response_tokens = []
     print("\nAssistant: ", end="", flush=True)
-    for token_column, token_masks in engine.generate(conversation_tokens, **generate_kwargs):
+    for token_column, token_masks in engine.generate(prompt_tokens, **generate_kwargs):
         token = token_column[0] # pop the batch dimension (num_samples=1)
         response_tokens.append(token)
         token_text = tokenizer.decode([token])
         print(token_text, end="", flush=True)
     print()
-    # we have to ensure that the assistant end token is the last token
-    # so even if generation ends due to max tokens, we have to append it to the end
-    if response_tokens[-1] != assistant_end:
-        response_tokens.append(assistant_end)
-    conversation_tokens.extend(response_tokens)
+    conversation["messages"].append({"role": "assistant", "content": tokenizer.decode(response_tokens)})
 
     # In the prompt mode, we only want a single response and exit
     if args.prompt:

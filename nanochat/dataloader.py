@@ -1,16 +1,16 @@
 """
 Distributed dataloaders for pretraining.
 
-BOS-aligned bestfit:
-   - Every row starts with BOS token
+Document-start aligned bestfit:
+   - Every row starts with the tokenizer's document-start token
    - Documents packed using best-fit algorithm to minimize cropping
    - When no document fits remaining space, crops a document to fill exactly
    - 100% utilization (no padding), ~35% tokens cropped at T=2048
 
 Compared to the original tokenizing_distributed_data_loader:
-BOS-aligned loses ~35% of tokens to cropping, but ensures that
+This loader loses ~35% of tokens to cropping, but ensures that
 there are fewer "confusing" tokens in the train/val batches as every token can
-now attend back to the BOS token and sees the full context of the document.
+attend back to the document-start token and see the full context of the document.
 
 Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
@@ -78,7 +78,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     buffer_size=1000
 ):
     """
-    BOS-aligned dataloader with Best-Fit Cropping.
+    Document-start aligned dataloader with Best-Fit Cropping.
 
     Reduces token waste compared to simple greedy cropping by searching a buffer
     for documents that fit well, while maintaining 100% utilization (no padding).
@@ -89,7 +89,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     3. When nothing fits, crop a doc to fill remaining space exactly
 
     Key properties:
-    - Every row starts with BOS
+    - Every row starts with the tokenizer's document-start token
     - 100% utilization (no padding, every token is trained on)
     - Approximately 35% of all tokens are discarded due to cropping
     """
@@ -97,14 +97,14 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
     row_capacity = T + 1
     batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
-    bos_token = tokenizer.get_bos_token_id()
+    document_start = tokenizer.get_document_start_token_id()
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1
 
     def refill_buffer():
         nonlocal pq_idx, rg_idx, epoch
         doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+        token_lists = tokenizer.encode(doc_batch, prepend=document_start, num_threads=tokenizer_threads)
         for tokens in token_lists:
             doc_buffer.append(tokens)
 

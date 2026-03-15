@@ -32,7 +32,7 @@ import argparse
 import torch
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
-from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
+from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
@@ -64,22 +64,68 @@ class ModelWrapper:
         return next(self.model.parameters()).device
 
 
+class HFAutoTokenizerAdapter:
+    """Small adapter for evaluating external HuggingFace causal LMs."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def get_vocab_size(self):
+        return len(self.tokenizer)
+
+    def get_pad_token_id(self):
+        pad = self.tokenizer.pad_token_id
+        if pad is None:
+            pad = self.get_document_start_token_id()
+        return pad
+
+    def get_eos_token_id(self):
+        return self.tokenizer.eos_token_id
+
+    def get_document_start_token_id(self):
+        for token_id in [self.tokenizer.bos_token_id, self.tokenizer.eos_token_id, self.tokenizer.pad_token_id]:
+            if token_id is not None:
+                return token_id
+        raise ValueError("Tokenizer has no usable document start token")
+
+    def _encode_one(self, text, prepend=None, append=None):
+        ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
+        if prepend is not None:
+            ids.insert(0, prepend)
+        if append is not None:
+            ids.append(append)
+        return ids
+
+    def encode(self, text, *args, **kwargs):
+        if isinstance(text, str):
+            return self._encode_one(text, *args, **kwargs)
+        if isinstance(text, list):
+            return [self._encode_one(t, *args, **kwargs) for t in text]
+        raise ValueError(f"Invalid input type: {type(text)}")
+
+    def __call__(self, *args, **kwargs):
+        return self.encode(*args, **kwargs)
+
+    def decode(self, ids):
+        return self.tokenizer.decode(ids, skip_special_tokens=False)
+
+
 def load_hf_model(hf_path: str, device):
     """Load a HuggingFace model and tokenizer."""
     print0(f"Loading HuggingFace model from: {hf_path}")
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     model = AutoModelForCausalLM.from_pretrained(hf_path)
     model.to(device)
     model.eval()
     max_seq_len = 1024 if "gpt2" in hf_path else None
     model = ModelWrapper(model, max_seq_len=max_seq_len)
-    tokenizer = HuggingFaceTokenizer.from_pretrained(hf_path)
+    tokenizer = HFAutoTokenizerAdapter(AutoTokenizer.from_pretrained(hf_path))
     return model, tokenizer
 
 
 def get_hf_token_bytes(tokenizer, device="cpu"):
     """Compute token_bytes tensor for a HuggingFace tokenizer."""
-    vocab_size = tokenizer.tokenizer.get_vocab_size()
+    vocab_size = tokenizer.get_vocab_size()
     token_bytes = torch.zeros(vocab_size, dtype=torch.int64, device=device)
     for token_id in range(vocab_size):
         token_str = tokenizer.tokenizer.decode([token_id])
@@ -239,7 +285,7 @@ def main():
             engine = Engine(model, tokenizer)
             print0("\nConditioned samples:")
             for prompt in prompts:
-                tokens = tokenizer(prompt, prepend="<|bos|>")
+                tokens = tokenizer(prompt, prepend=tokenizer.get_document_start_token_id())
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
                 sample_str = tokenizer.decode(sample[0])
                 print0("-" * 80)
@@ -247,7 +293,7 @@ def main():
                 samples.append(sample_str)
 
             print0("\nUnconditioned samples:")
-            tokens = tokenizer("", prepend="<|bos|>")
+            tokens = tokenizer("", prepend=tokenizer.get_document_start_token_id())
             uncond, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
             for sample in uncond:
                 sample_str = tokenizer.decode(sample)

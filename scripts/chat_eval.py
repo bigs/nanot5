@@ -82,62 +82,56 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
 # -----------------------------------------------------------------------------
 # Categorical evaluation loop
-# A lot easier because we don't have to sample. Therefore, we can actually go
-# batches at a time and just check the logits for correct answer choices.
+# We still score answer choices directly, but we do it over full candidate
+# sequences so SentencePiece is free to tokenize answers into multiple tokens.
+
+def score_candidates(model, tokenizer, prompt_ids, candidates, device):
+    pad_token = tokenizer.get_pad_token_id()
+    sequences = []
+    spans = []
+    for candidate in candidates:
+        candidate_ids = tokenizer.encode(candidate)
+        sequence = prompt_ids + candidate_ids
+        sequences.append(sequence)
+        spans.append((len(prompt_ids), len(sequence)))
+
+    max_length = max(len(seq) for seq in sequences)
+    input_ids = torch.full((len(sequences), max_length), pad_token, dtype=torch.long, device=device)
+    for row_idx, sequence in enumerate(sequences):
+        input_ids[row_idx, :len(sequence)] = torch.tensor(sequence, dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        logits = model(input_ids)
+    target_ids = torch.roll(input_ids, shifts=-1, dims=1)
+    losses = torch.nn.functional.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        target_ids.view(-1),
+        reduction="none",
+    ).view_as(input_ids)
+    losses[:, -1] = float("nan")
+
+    return [
+        losses[row_idx, start_idx - 1:end_idx - 1].mean().item()
+        for row_idx, (start_idx, end_idx) in enumerate(spans)
+    ]
 
 def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
-    bos = tokenizer.get_bos_token_id() # use BOS as pad token is ok, these positions are ignored
 
-    # We'll process batches of independent problems at a time because there is no sampling needed
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
-    ceil_div = lambda x, y: -(-x // y)
-    num_batches = ceil_div(num_problems, batch_size)
 
-    # Run the evaluation
-    letter_to_id_cache = {} # many letters will repeat often, let's save the tokenizer some work
     num_passed, total = 0, 0
-    for i in range(ddp_rank, num_batches, ddp_world_size):
-        i0, i1 = i * batch_size, min((i + 1) * batch_size, num_problems)
-
-        # Prepare the batch of problems. They might all be of different length, so we pad/collate them.
-        conversations = [task_object[ii] for ii in range(i0, i1)]
-        prompt_ids = [tokenizer.render_for_completion(conversation) for conversation in conversations] # TODO: remake the way this works
-        max_length = max(len(ids) for ids in prompt_ids)
-        answer_time_positions = [len(ids) - 1 for ids in prompt_ids] # where the last token is (and the predicted answer)
-        padded_prompt_ids = [ids + [bos] * (max_length - len(ids)) for ids in prompt_ids]
-        prompt_ids = torch.tensor(padded_prompt_ids, dtype=torch.long, device=device)
-
-        # Get the logits for the whole batch of conversations in parallel (efficiency win here)
-        with torch.no_grad():
-            logits = model(prompt_ids) # (B, T, V)
-
-        # Focus on the available answer on just the letters corresponding to choices
-        # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters
-        # The much harder alternative would be to just generate from the Assistant and check if it responded with the correct
-        # letter (e.g. A, B, C, D), but evaluations typically make the task easier in this way.
-        for idx, conversation in enumerate(conversations):
-            # get the token ids of all the available letters of this problem
-            letters = conversation['letters']
-            letter_ids = []
-            for letter in letters:
-                if not letter in letter_to_id_cache:
-                    encoded_letter = tokenizer.encode(letter)
-                    assert len(encoded_letter) == 1, "Each letter must be a single token"
-                    letter_to_id_cache[letter] = encoded_letter[0]
-                letter_ids.append(letter_to_id_cache[letter])
-            # focus logits just down to the answer position and the available letters of the answer
-            answer_pos = answer_time_positions[idx]
-            focus_logits = logits[idx, answer_pos, letter_ids]
-            # get the argmax letter (the predicted answer)
-            argmax_letter_id = focus_logits.argmax(dim=-1).item()
-            predicted_letter = letters[argmax_letter_id]
-            # evaluate the outcome
-            outcome = task_object.evaluate(conversation, predicted_letter)
-            num_passed += int(outcome)
-            total += 1
+    for idx in range(ddp_rank, num_problems, ddp_world_size):
+        conversation = task_object[idx]
+        prompt_ids = tokenizer.render_for_completion(conversation)
+        letters = conversation["letters"]
+        candidate_scores = score_candidates(model, tokenizer, prompt_ids, letters, device)
+        predicted_letter = letters[candidate_scores.index(min(candidate_scores))]
+        outcome = task_object.evaluate(conversation, predicted_letter)
+        num_passed += int(outcome)
+        total += 1
 
     # Aggregate results across all ranks
     if ddp:
