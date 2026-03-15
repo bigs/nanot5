@@ -160,6 +160,9 @@ class _Float8Matmul(torch.autograd.Function):
         # === GEMM 1: grad_input = grad_output @ weight ===
         # Shapes: [B, N] @ [N, K] -> [B, K]
         # Gradients use e5m2 (wider range), weights use e4m3 (higher precision)
+        # grad_output may arrive with non-row-major strides from upstream views,
+        # but _scaled_mm requires its first operand to be row-major.
+        grad_output = grad_output.contiguous()
         go_fp8, go_inv = _to_fp8(grad_output, torch.float8_e5m2)
         # go_fp8 is [B, N] contiguous = row-major, good for first arg
         # w_fp8 is [N, K] contiguous = row-major, need column-major for second arg

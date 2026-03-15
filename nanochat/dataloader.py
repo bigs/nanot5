@@ -8,7 +8,13 @@ Each document is turned into one T5 denoising example:
 - batches are padded to fixed shape and returned as dicts ready for T5
 """
 
+import os
+import queue
 import random
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import torch
 import pyarrow.parquet as pq
@@ -21,6 +27,26 @@ from nanochat.tokenizer import DENOISING_EXTRA_ID_OFFSET, EXTRA_ID_COUNT
 NOISE_DENSITY = 0.15
 MEAN_NOISE_SPAN_LENGTH = 3.0
 MAX_DENOISING_SPANS = EXTRA_ID_COUNT - DENOISING_EXTRA_ID_OFFSET - 1
+DEFAULT_PREFETCH_BATCHES = 4
+DEFAULT_CORRUPTION_DRAWS_PER_DOC = 4
+
+
+@dataclass
+class _CachedDoc:
+    token_ids: list[int]
+    draws_left: int
+
+
+class _ProducerError:
+    def __init__(self, error):
+        self.error = error
+
+
+def _normalize_loader_state(state):
+    if isinstance(state, dict):
+        return dict(state)
+    pq_idx, rg_idx, epoch = state
+    return {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
@@ -141,54 +167,212 @@ def _build_denoising_example(tokenizer, body, max_input_tokens, max_target_token
     return [document_start, sentinel], [sentinel, body[0], tokenizer.get_denoising_token_id(1), eos]
 
 
-def tokenizing_distributed_seq2seq_loader_with_state(
-    tokenizer, B, T, split,
-    tokenizer_threads=4, tokenizer_batch_size=128,
-    device="cuda", resume_state_dict=None,
-    buffer_size=1000,
-):
-    assert split in ["train", "val"], "split must be 'train' or 'val'"
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
-    doc_buffer = []
-    pq_idx, rg_idx, epoch = 0, 0, 1
-    rng = random.Random(1234 + get_dist_info()[1])
-    pad_token = tokenizer.get_pad_token_id()
-    input_ids = torch.full((B, T), pad_token, dtype=torch.long, device=device)
-    attention_mask = torch.zeros((B, T), dtype=torch.bool, device=device)
-    targets = torch.full((B, T), -1, dtype=torch.long, device=device)
+def _resolve_tokenizer_workers(tokenizer_threads, tokenizer_workers):
+    if tokenizer_workers is None:
+        tokenizer_workers = min(max(1, tokenizer_threads), 4)
+    tokenizer_workers = max(1, min(tokenizer_workers, tokenizer_threads))
+    threads_per_worker = max(1, tokenizer_threads // tokenizer_workers)
+    return tokenizer_workers, threads_per_worker
 
-    def refill_buffer():
-        nonlocal pq_idx, rg_idx, epoch
-        doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
-        token_lists = tokenizer.encode(doc_batch, num_threads=tokenizer_threads)
-        doc_buffer.extend(token_lists)
 
-    while True:
-        input_ids.fill_(pad_token)
-        attention_mask.zero_()
-        targets.fill_(-1)
-        for row_idx in range(B):
-            while len(doc_buffer) < buffer_size:
-                refill_buffer()
-            doc_tokens = doc_buffer.pop(0)
-            source_ids, target_ids = _build_denoising_example(tokenizer, doc_tokens, T, T, rng)
-            source_len = min(len(source_ids), T)
-            target_len = min(len(target_ids), T)
+class _PrefetchingSeq2SeqLoader:
+    def __init__(
+        self,
+        tokenizer,
+        B,
+        T,
+        split,
+        tokenizer_threads=4,
+        tokenizer_workers=None,
+        tokenizer_batch_size=128,
+        device="cuda",
+        resume_state_dict=None,
+        buffer_size=1000,
+        corruption_draws_per_doc=DEFAULT_CORRUPTION_DRAWS_PER_DOC,
+        prefetch_batches=DEFAULT_PREFETCH_BATCHES,
+    ):
+        assert split in ["train", "val"], "split must be 'train' or 'val'"
+        assert tokenizer_threads >= 1, "tokenizer_threads must be >= 1"
+        assert buffer_size >= 1, "buffer_size must be >= 1"
+        assert corruption_draws_per_doc >= 1, "corruption_draws_per_doc must be >= 1"
+        assert prefetch_batches >= 1, "prefetch_batches must be >= 1"
+
+        self.tokenizer = tokenizer
+        self.B = B
+        self.T = T
+        self.device = torch.device(device)
+        self.use_pinned_memory = self.device.type == "cuda"
+        self.buffer_size = buffer_size
+        self.corruption_draws_per_doc = corruption_draws_per_doc
+        self.prefetch_batches = prefetch_batches
+        self.rng = random.Random(1234 + get_dist_info()[1])
+        self.pad_token = tokenizer.get_pad_token_id()
+        self.doc_batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
+        self.doc_cache = deque()
+        self.tokenization_futures = deque()
+        self.last_resolved_state = {"pq_idx": 0, "rg_idx": 0, "epoch": 1}
+        self.stop_event = threading.Event()
+        self.batch_queue = queue.Queue(maxsize=prefetch_batches)
+        self.tokenizer_workers, self.threads_per_worker = _resolve_tokenizer_workers(tokenizer_threads, tokenizer_workers)
+        self.executor = ThreadPoolExecutor(max_workers=self.tokenizer_workers, thread_name_prefix="t5tok")
+        self.producer_thread = threading.Thread(target=self._producer_loop, name="t5-batch-producer", daemon=True)
+        self.producer_thread.start()
+
+    def _current_staged_docs(self):
+        pending_docs = sum(size for _, _, size in self.tokenization_futures)
+        return len(self.doc_cache) + pending_docs
+
+    def _submit_tokenization(self):
+        doc_batch, state_dict = next(self.doc_batches)
+        future = self.executor.submit(self.tokenizer.encode, doc_batch, num_threads=self.threads_per_worker)
+        self.tokenization_futures.append((future, _normalize_loader_state(state_dict), len(doc_batch)))
+
+    def _schedule_tokenization(self):
+        while (
+            not self.stop_event.is_set()
+            and len(self.tokenization_futures) < self.tokenizer_workers
+            and self._current_staged_docs() < self.buffer_size
+        ):
+            self._submit_tokenization()
+
+    def _collect_tokenized_docs(self, block=False):
+        while self.tokenization_futures:
+            future, state_dict, _ = self.tokenization_futures[0]
+            if not block and not future.done():
+                break
+            self.tokenization_futures.popleft()
+            token_lists = future.result()
+            self.last_resolved_state = state_dict
+            self.doc_cache.extend(
+                _CachedDoc(token_ids=token_ids, draws_left=self.corruption_draws_per_doc)
+                for token_ids in token_lists
+            )
+            block = False
+
+    def _ensure_cached_docs(self, minimum_docs):
+        while len(self.doc_cache) < minimum_docs:
+            self._schedule_tokenization()
+            self._collect_tokenized_docs(block=True)
+        self._schedule_tokenization()
+        self._collect_tokenized_docs(block=False)
+
+    def _pop_cached_doc(self):
+        self._ensure_cached_docs(1)
+        cached_doc = self.doc_cache.popleft()
+        token_ids = cached_doc.token_ids
+        cached_doc.draws_left -= 1
+        if cached_doc.draws_left > 0:
+            self.doc_cache.append(cached_doc)
+        return token_ids
+
+    def _build_cpu_batch(self):
+        self._ensure_cached_docs(self.B)
+        input_ids = torch.full((self.B, self.T), self.pad_token, dtype=torch.long, pin_memory=self.use_pinned_memory)
+        attention_mask = torch.zeros((self.B, self.T), dtype=torch.bool, pin_memory=self.use_pinned_memory)
+        targets = torch.full((self.B, self.T), -1, dtype=torch.long, pin_memory=self.use_pinned_memory)
+
+        for row_idx in range(self.B):
+            doc_tokens = self._pop_cached_doc()
+            source_ids, target_ids = _build_denoising_example(self.tokenizer, doc_tokens, self.T, self.T, self.rng)
+            source_len = min(len(source_ids), self.T)
+            target_len = min(len(target_ids), self.T)
             if source_len > 0:
-                input_ids[row_idx, :source_len] = torch.tensor(source_ids[:source_len], dtype=torch.long, device=device)
+                input_ids[row_idx, :source_len] = torch.tensor(source_ids[:source_len], dtype=torch.long)
                 attention_mask[row_idx, :source_len] = True
             if target_len > 0:
-                targets[row_idx, :target_len] = torch.tensor(target_ids[:target_len], dtype=torch.long, device=device)
+                targets[row_idx, :target_len] = torch.tensor(target_ids[:target_len], dtype=torch.long)
 
-        state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
+        state_dict = dict(self.last_resolved_state)
         batch = {
-            "input_ids": input_ids.clone(),
-            "attention_mask": attention_mask.clone(),
-            "targets": targets.clone(),
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "targets": targets,
         }
-        yield batch, state_dict
+        return batch, state_dict
+
+    def _producer_loop(self):
+        try:
+            self._schedule_tokenization()
+            self._collect_tokenized_docs(block=True)
+            while not self.stop_event.is_set():
+                batch = self._build_cpu_batch()
+                while not self.stop_event.is_set():
+                    try:
+                        self.batch_queue.put(batch, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as error:
+            while not self.stop_event.is_set():
+                try:
+                    self.batch_queue.put(_ProducerError(error), timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    def _move_to_device(self, batch):
+        if self.device.type == "cpu":
+            return batch
+        return {
+            key: value.to(device=self.device, non_blocking=self.use_pinned_memory)
+            for key, value in batch.items()
+        }
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.batch_queue.get()
+        if isinstance(item, _ProducerError):
+            self.close()
+            raise item.error
+        batch, state_dict = item
+        return self._move_to_device(batch), state_dict
+
+    def close(self):
+        if self.stop_event.is_set():
+            return
+        self.stop_event.set()
+        self.producer_thread.join(timeout=1.0)
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
+    def __del__(self):
+        self.close()
+
+
+def tokenizing_distributed_seq2seq_loader_with_state(
+    tokenizer, B, T, split,
+    tokenizer_threads=4, tokenizer_workers=None, tokenizer_batch_size=128,
+    device="cuda", resume_state_dict=None,
+    buffer_size=1000,
+    corruption_draws_per_doc=DEFAULT_CORRUPTION_DRAWS_PER_DOC,
+    prefetch_batches=DEFAULT_PREFETCH_BATCHES,
+):
+    loader = _PrefetchingSeq2SeqLoader(
+        tokenizer,
+        B,
+        T,
+        split,
+        tokenizer_threads=tokenizer_threads,
+        tokenizer_workers=tokenizer_workers,
+        tokenizer_batch_size=tokenizer_batch_size,
+        device=device,
+        resume_state_dict=resume_state_dict,
+        buffer_size=buffer_size,
+        corruption_draws_per_doc=corruption_draws_per_doc,
+        prefetch_batches=prefetch_batches,
+    )
+    try:
+        while True:
+            yield next(loader)
+    finally:
+        loader.close()
 
 
 def tokenizing_distributed_seq2seq_loader(*args, **kwargs):
-    for batch, state_dict in tokenizing_distributed_seq2seq_loader_with_state(*args, **kwargs):
-        yield batch
+    loader = tokenizing_distributed_seq2seq_loader_with_state(*args, **kwargs)
+    try:
+        for batch, state_dict in loader:
+            yield batch
+    finally:
+        loader.close()
