@@ -3,7 +3,7 @@ import os
 import time
 import argparse
 import torch
-from nanochat.tokenizer import SentencePieceTokenizer
+from nanochat.tokenizer import SentencePieceTokenizer, build_token_bytes
 from nanochat.common import get_base_dir
 from nanochat.dataset import parquets_iter_batched
 
@@ -70,18 +70,7 @@ assert decoded == test_text
 # for efficient evaluation of bits per byte. Unlike the typical mean loss, this
 # allows us to report a loss that is invariant to the vocab size of the tokenizer.
 # The bits per byte on the validation set is then one of the primary metrics we care about.
-vocab_size = tokenizer.get_vocab_size()
-special_set = set(tokenizer.get_special_tokens())
-token_bytes = []
-for token_id in range(vocab_size):
-    token_piece = tokenizer.id_to_token(token_id)
-    if token_piece in special_set:
-        token_bytes.append(0)
-    else:
-        token_str = tokenizer.decode([token_id])
-        id_bytes = len(token_str.encode("utf-8"))
-        token_bytes.append(id_bytes)
-token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device='cpu')
+token_bytes = build_token_bytes(tokenizer, device='cpu')
 token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
 with open(token_bytes_path, "wb") as f:
     torch.save(token_bytes, f)
@@ -93,7 +82,7 @@ token_bytes_nonzero = (token_bytes[token_bytes > 0]).to(dtype=torch.float32)
 get_report().log(section="Tokenizer training", data=[
     vars(args), # argparse command line arguments
     {"train_time": train_time},
-    {"num_special_tokens": len(special_set)},
+    {"num_special_tokens": len(tokenizer.get_special_tokens())},
     {
         "token_bytes_min": int(token_bytes_nonzero.min().item()),
         "token_bytes_max": int(token_bytes_nonzero.max().item()),

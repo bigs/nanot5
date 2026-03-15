@@ -87,32 +87,42 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
 def score_candidates(model, tokenizer, prompt_ids, candidates, device):
     pad_token = tokenizer.get_pad_token_id()
-    sequences = []
-    spans = []
-    for candidate in candidates:
-        candidate_ids = tokenizer.encode(candidate)
-        sequence = prompt_ids + candidate_ids
-        sequences.append(sequence)
-        spans.append((len(prompt_ids), len(sequence)))
+    decoder_start = tokenizer.get_decoder_start_token_id()
+    assistant_end = tokenizer.get_chat_token_id("assistant_end")
+    prompt_length = len(prompt_ids)
+    input_ids = torch.full((len(candidates), prompt_length), pad_token, dtype=torch.long, device=device)
+    attention_mask = torch.zeros((len(candidates), prompt_length), dtype=torch.bool, device=device)
+    input_ids[:, :prompt_length] = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+    attention_mask[:, :prompt_length] = True
 
-    max_length = max(len(seq) for seq in sequences)
-    input_ids = torch.full((len(sequences), max_length), pad_token, dtype=torch.long, device=device)
-    for row_idx, sequence in enumerate(sequences):
-        input_ids[row_idx, :len(sequence)] = torch.tensor(sequence, dtype=torch.long, device=device)
+    target_sequences = []
+    for candidate in candidates:
+        target_sequences.append(tokenizer.encode(candidate) + [assistant_end])
+
+    max_target_length = max(len(target) for target in target_sequences)
+    decoder_input_ids = torch.full((len(candidates), max_target_length), pad_token, dtype=torch.long, device=device)
+    decoder_attention_mask = torch.zeros((len(candidates), max_target_length), dtype=torch.bool, device=device)
+    targets = torch.full((len(candidates), max_target_length), -1, dtype=torch.long, device=device)
+    decoder_input_ids[:, 0] = decoder_start
+    for row_idx, target_ids in enumerate(target_sequences):
+        target_length = len(target_ids)
+        targets[row_idx, :target_length] = torch.tensor(target_ids, dtype=torch.long, device=device)
+        decoder_attention_mask[row_idx, :target_length] = True
+        if target_length > 1:
+            decoder_input_ids[row_idx, 1:target_length] = torch.tensor(target_ids[:-1], dtype=torch.long, device=device)
 
     with torch.no_grad():
-        logits = model(input_ids)
-    target_ids = torch.roll(input_ids, shifts=-1, dims=1)
-    losses = torch.nn.functional.cross_entropy(
-        logits.view(-1, logits.size(-1)),
-        target_ids.view(-1),
-        reduction="none",
-    ).view_as(input_ids)
-    losses[:, -1] = float("nan")
-
+        loss2d = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            targets=targets,
+            loss_reduction="none",
+        )
     return [
-        losses[row_idx, start_idx - 1:end_idx - 1].mean().item()
-        for row_idx, (start_idx, end_idx) in enumerate(spans)
+        loss2d[row_idx, :len(target_ids)].mean().item()
+        for row_idx, target_ids in enumerate(target_sequences)
     ]
 
 def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):

@@ -72,6 +72,8 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
+if meta.get("model_type") == "t5":
+    raise RuntimeError("chat_rl.py still assumes decoder-only logprob contracts and has not been integrated for T5 yet")
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------

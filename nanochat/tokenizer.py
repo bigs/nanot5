@@ -7,6 +7,7 @@ existing chat/tool formatting so the rest of the stack can stay lightweight.
 """
 
 import copy
+import hashlib
 import io
 import os
 from functools import lru_cache
@@ -25,6 +26,7 @@ CHAT_TOKEN_PIECES = {
     "output_start": "<extra_id_6>",
     "output_end": "<extra_id_7>",
 }
+DENOISING_EXTRA_ID_OFFSET = len(CHAT_TOKEN_PIECES)
 
 
 class SentencePieceTokenizer:
@@ -130,6 +132,16 @@ class SentencePieceTokenizer:
     def get_chat_token_id(self, name):
         return self.chat_token_ids[name]
 
+    def get_extra_id_token_id(self, index):
+        return self._require_token(f"<extra_id_{index}>")
+
+    def get_denoising_token_id(self, span_index):
+        return self.get_extra_id_token_id(DENOISING_EXTRA_ID_OFFSET + span_index)
+
+    def get_fingerprint(self):
+        assert self.model_proto is not None, "Tokenizer fingerprint requires serialized SentencePiece model bytes"
+        return hashlib.sha256(self.model_proto).hexdigest()
+
     def _encode_one(self, text, prepend=None, append=None, num_threads=None):
         assert isinstance(text, str)
         ids = list(self.processor.encode(text, out_type=int, num_threads=num_threads))
@@ -160,6 +172,52 @@ class SentencePieceTokenizer:
             f.write(self.model_proto)
         print(f"Saved SentencePiece model to {model_path}")
 
+    def _normalize_messages(self, conversation):
+        if conversation["messages"][0]["role"] != "system":
+            return conversation["messages"]
+        conversation = copy.deepcopy(conversation)
+        messages = conversation["messages"]
+        assert messages[1]["role"] == "user", "System message must be followed by a user message"
+        messages[1]["content"] = messages[0]["content"] + "\n\n" + messages[1]["content"]
+        return messages[1:]
+
+    def _encode_assistant_content(self, content):
+        ids, mask = [], []
+
+        def add_tokens(token_ids, mask_val):
+            if isinstance(token_ids, int):
+                token_ids = [token_ids]
+            ids.extend(token_ids)
+            mask.extend([mask_val] * len(token_ids))
+
+        assistant_end = self.get_chat_token_id("assistant_end")
+        python_start = self.get_chat_token_id("python_start")
+        python_end = self.get_chat_token_id("python_end")
+        output_start = self.get_chat_token_id("output_start")
+        output_end = self.get_chat_token_id("output_end")
+
+        if isinstance(content, str):
+            add_tokens(self.encode(content), 1)
+        elif isinstance(content, list):
+            for part in content:
+                value_ids = self.encode(part["text"])
+                if part["type"] == "text":
+                    add_tokens(value_ids, 1)
+                elif part["type"] == "python":
+                    add_tokens(python_start, 1)
+                    add_tokens(value_ids, 1)
+                    add_tokens(python_end, 1)
+                elif part["type"] == "python_output":
+                    add_tokens(output_start, 0)
+                    add_tokens(value_ids, 0)
+                    add_tokens(output_end, 0)
+                else:
+                    raise ValueError(f"Unknown part type: {part['type']}")
+        else:
+            raise ValueError(f"Unknown content type: {type(content)}")
+        add_tokens(assistant_end, 1)
+        return ids, mask
+
     def render_conversation(self, conversation, max_tokens=2048):
         """
         Tokenize a single chat conversation and return:
@@ -174,25 +232,13 @@ class SentencePieceTokenizer:
             ids.extend(token_ids)
             mask.extend([mask_val] * len(token_ids))
 
-        if conversation["messages"][0]["role"] == "system":
-            conversation = copy.deepcopy(conversation)
-            messages = conversation["messages"]
-            assert messages[1]["role"] == "user", "System message must be followed by a user message"
-            messages[1]["content"] = messages[0]["content"] + "\n\n" + messages[1]["content"]
-            messages = messages[1:]
-        else:
-            messages = conversation["messages"]
+        messages = self._normalize_messages(conversation)
         assert len(messages) >= 1, f"Conversation has less than 1 message: {messages}"
 
         document_start = self.get_document_start_token_id()
         user_start = self.get_chat_token_id("user_start")
         user_end = self.get_chat_token_id("user_end")
         assistant_start = self.get_chat_token_id("assistant_start")
-        assistant_end = self.get_chat_token_id("assistant_end")
-        python_start = self.get_chat_token_id("python_start")
-        python_end = self.get_chat_token_id("python_end")
-        output_start = self.get_chat_token_id("output_start")
-        output_end = self.get_chat_token_id("output_end")
 
         add_tokens(document_start, 0)
         for i, message in enumerate(messages):
@@ -208,26 +254,9 @@ class SentencePieceTokenizer:
                 continue
 
             add_tokens(assistant_start, 0)
-            if isinstance(content, str):
-                add_tokens(self.encode(content), 1)
-            elif isinstance(content, list):
-                for part in content:
-                    value_ids = self.encode(part["text"])
-                    if part["type"] == "text":
-                        add_tokens(value_ids, 1)
-                    elif part["type"] == "python":
-                        add_tokens(python_start, 1)
-                        add_tokens(value_ids, 1)
-                        add_tokens(python_end, 1)
-                    elif part["type"] == "python_output":
-                        add_tokens(output_start, 0)
-                        add_tokens(value_ids, 0)
-                        add_tokens(output_end, 0)
-                    else:
-                        raise ValueError(f"Unknown part type: {part['type']}")
-            else:
-                raise ValueError(f"Unknown content type: {type(content)}")
-            add_tokens(assistant_end, 1)
+            content_ids, content_mask = self._encode_assistant_content(content)
+            add_tokens(content_ids, 0)
+            mask[-len(content_mask):] = content_mask
 
         ids = ids[:max_tokens]
         mask = mask[:max_tokens]
@@ -256,6 +285,20 @@ class SentencePieceTokenizer:
         ids.append(self.get_chat_token_id("assistant_start"))
         return ids
 
+    def render_sft_example(self, conversation, max_input_tokens=2048, max_target_tokens=2048):
+        prompt_ids = self.render_for_completion(conversation)
+        assistant_content = conversation["messages"][-1]["content"]
+        target_ids, target_mask = self._encode_assistant_content(assistant_content)
+        if len(prompt_ids) > max_input_tokens:
+            prompt_ids = [self.get_document_start_token_id()] + prompt_ids[-(max_input_tokens - 1):]
+        if len(target_ids) > max_target_tokens:
+            target_ids = target_ids[:max_target_tokens]
+            target_mask = target_mask[:max_target_tokens]
+        decoder_input_ids = [self.get_decoder_start_token_id()] + target_ids[:-1]
+        targets = [token_id if mask_val else -1 for token_id, mask_val in zip(target_ids, target_mask)]
+        decoder_attention_mask = [1] * len(decoder_input_ids)
+        return prompt_ids, decoder_input_ids, targets, decoder_attention_mask
+
 
 def get_tokenizer():
     from nanochat.common import get_base_dir
@@ -263,6 +306,24 @@ def get_tokenizer():
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
     return SentencePieceTokenizer.from_directory(tokenizer_dir)
+
+
+def get_tokenizer_fingerprint(tokenizer=None):
+    tokenizer = get_tokenizer() if tokenizer is None else tokenizer
+    return tokenizer.get_fingerprint()
+
+
+def build_token_bytes(tokenizer, device="cpu"):
+    import torch
+
+    vocab_size = tokenizer.get_vocab_size()
+    special_set = set(tokenizer.get_special_tokens())
+    token_bytes = torch.zeros(vocab_size, dtype=torch.int32, device=device)
+    for token_id in range(vocab_size):
+        token_piece = tokenizer.id_to_token(token_id)
+        if token_piece not in special_set:
+            token_bytes[token_id] = len(tokenizer.decode([token_id]).encode("utf-8"))
+    return token_bytes
 
 
 def get_token_bytes(device="cpu"):

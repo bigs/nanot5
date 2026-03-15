@@ -11,13 +11,14 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 
 import gc
 import argparse
+from dataclasses import asdict
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanochat.tokenizer import get_token_bytes
+from nanochat.tokenizer import get_token_bytes, get_tokenizer_fingerprint
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
@@ -178,134 +179,84 @@ val_dataset = TaskMixture([
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
     GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
 ]) # total: 24K + 14K + 1.32K ~= 39K rows
-# DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
+# DataLoader is defined here and yields fixed-shape seq2seq batch dicts for T5.
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.
 last_step = False # we will toggle this to True when we reach the end of the training dataset
 approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
 current_epoch = 1 # track epoch for logging
-def sft_data_generator_bos_bestfit(split, buffer_size=100):
-    """
-    Document-start aligned dataloader for SFT with bestfit-pad packing.
+def build_sft_batch(examples):
+    pad_token = tokenizer.get_pad_token_id()
+    use_cuda = device_type == "cuda"
+    batch_size = len(examples)
+    input_ids = torch.full((batch_size, args.max_seq_len), pad_token, dtype=torch.long, pin_memory=use_cuda)
+    attention_mask = torch.zeros((batch_size, args.max_seq_len), dtype=torch.bool, pin_memory=use_cuda)
+    decoder_input_ids = torch.full((batch_size, args.max_seq_len), pad_token, dtype=torch.long, pin_memory=use_cuda)
+    decoder_attention_mask = torch.zeros((batch_size, args.max_seq_len), dtype=torch.bool, pin_memory=use_cuda)
+    targets = torch.full((batch_size, args.max_seq_len), -1, dtype=torch.long, pin_memory=use_cuda)
+    for row_idx, (prompt_ids, decoder_ids, target_ids, decoder_mask) in enumerate(examples):
+        prompt_len = min(len(prompt_ids), args.max_seq_len)
+        decoder_len = min(len(decoder_ids), args.max_seq_len)
+        target_len = min(len(target_ids), args.max_seq_len)
+        if prompt_len > 0:
+            input_ids[row_idx, :prompt_len] = torch.tensor(prompt_ids[:prompt_len], dtype=torch.long)
+            attention_mask[row_idx, :prompt_len] = True
+        if decoder_len > 0:
+            decoder_input_ids[row_idx, :decoder_len] = torch.tensor(decoder_ids[:decoder_len], dtype=torch.long)
+            decoder_attention_mask[row_idx, :decoder_len] = torch.tensor(decoder_mask[:decoder_len], dtype=torch.bool)
+        if target_len > 0:
+            targets[row_idx, :target_len] = torch.tensor(target_ids[:target_len], dtype=torch.long)
+    return {
+        "input_ids": input_ids.to(device=device, non_blocking=use_cuda).contiguous(),
+        "attention_mask": attention_mask.to(device=device, non_blocking=use_cuda).contiguous(),
+        "decoder_input_ids": decoder_input_ids.to(device=device, non_blocking=use_cuda).contiguous(),
+        "decoder_attention_mask": decoder_attention_mask.to(device=device, non_blocking=use_cuda).contiguous(),
+        "targets": targets.to(device=device, non_blocking=use_cuda).contiguous(),
+    }
 
-    Each row in the batch starts with the tokenizer's document-start token.
-    Conversations are packed using best-fit algorithm. When no conversation fits,
-    the row is padded (instead of cropping) to ensure no tokens are ever discarded.
-    Padding positions have targets masked with -1 (ignore_index for cross-entropy).
-    """
+def sft_data_generator_seq2seq(split):
     global last_step, approx_progress, current_epoch
     assert split in {"train", "val"}, "split must be 'train' or 'val'"
     dataset = train_dataset if split == "train" else val_dataset
     dataset_size = len(dataset)
     assert dataset_size > 0
-    row_capacity = args.max_seq_len + 1  # +1 for target at last position
-    pad_token = tokenizer.get_pad_token_id()
-
-    # Conversation buffer: list of (token_ids, loss_mask) tuples
-    conv_buffer = []
-    cursor = ddp_rank  # Each rank processes different conversations (for fetching)
-    consumed = ddp_rank  # Track actual consumption separately from buffering
+    cursor = ddp_rank
+    consumed = ddp_rank
     epoch = 1
-    it = 0  # iteration counter
-
-    def refill_buffer():
-        nonlocal cursor, epoch
-        while len(conv_buffer) < buffer_size:
-            conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
-            cursor += ddp_world_size
-            if cursor >= dataset_size:
-                cursor = cursor % dataset_size
-                epoch += 1
-                # Note: last_step is now triggered based on consumption, not fetching
+    it = 0
 
     while True:
-        rows = []
-        mask_rows = []
-        row_lengths = []  # Track actual content length (excluding padding) for each row
+        examples = []
         for _ in range(args.device_batch_size):
-            row = []
-            mask_row = []
-            padded = False
-            while len(row) < row_capacity:
-                # Ensure buffer has conversations
-                while len(conv_buffer) < buffer_size:
-                    refill_buffer()
+            conversation = dataset[cursor]
+            examples.append(tokenizer.render_sft_example(
+                conversation,
+                max_input_tokens=args.max_seq_len,
+                max_target_tokens=args.max_seq_len,
+            ))
+            cursor += ddp_world_size
+            consumed += ddp_world_size
+            if cursor >= dataset_size:
+                cursor %= dataset_size
+                epoch += 1
 
-                remaining = row_capacity - len(row)
-
-                # Find largest conversation that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, (conv, _) in enumerate(conv_buffer):
-                    conv_len = len(conv)
-                    if conv_len <= remaining and conv_len > best_len:
-                        best_idx = i
-                        best_len = conv_len
-
-                if best_idx >= 0:
-                    # Found a conversation that fits - use it entirely
-                    conv, conv_mask = conv_buffer.pop(best_idx)
-                    row.extend(conv)
-                    mask_row.extend(conv_mask)
-                    consumed += ddp_world_size  # Track actual consumption
-                else:
-                    # No conversation fits - pad the remainder instead of cropping
-                    # This ensures we never discard any tokens
-                    content_len = len(row)
-                    row.extend([pad_token] * remaining)
-                    mask_row.extend([0] * remaining)
-                    padded = True
-                    break  # Row is now full (with padding)
-
-            # Track content length: full row if no padding, otherwise the length before padding
-            if padded:
-                row_lengths.append(content_len)
-            else:
-                row_lengths.append(row_capacity)
-            rows.append(row[:row_capacity])
-            mask_rows.append(mask_row[:row_capacity])
-
-        # Stopping condition to respect num_iterations, if given
         it += 1
         if 0 < args.num_iterations <= it and split == "train":
             last_step = True
 
-        # Update progress tracking (based on consumed, not cursor, to account for buffering)
         if split == "train":
             current_epoch = epoch
             if args.num_iterations > 0:
                 approx_progress = it / args.num_iterations
             else:
                 approx_progress = consumed / dataset_size
-            # Trigger last_step when we've consumed enough (instead of when cursor wraps)
             if consumed >= dataset_size:
                 last_step = True
 
-        # Build tensors
-        use_cuda = device_type == "cuda"
-        batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
-        inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda).contiguous()
-        targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
+        yield build_sft_batch(examples)
 
-        # Apply the loss mask from render_conversation (mask=1 for assistant completions,
-        # mask=0 for user prompts, document-start, special tokens, tool outputs). mask[1:] aligns
-        # with targets (shifted by 1). Unmasked positions get -1 (ignore_index).
-        mask_tensor = torch.tensor(mask_rows, dtype=torch.int8)
-        mask_targets = mask_tensor[:, 1:].to(device=device)
-        targets[mask_targets == 0] = -1
-
-        # Mask out padding positions in targets (set to -1 = ignore_index)
-        # For each row, positions >= (content_length - 1) in targets should be masked
-        for i, content_len in enumerate(row_lengths):
-            if content_len < row_capacity:
-                targets[i, content_len-1:] = -1
-
-        yield inputs, targets
-
-train_loader = sft_data_generator_bos_bestfit("train")
-build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
+train_loader = sft_data_generator_seq2seq("train")
+build_val_loader = lambda: sft_data_generator_seq2seq("val")
 progress = 0 # will go from 0 to 1 over the course of the epoch
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
@@ -328,7 +279,7 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
-x, y = next(train_loader) # prefetch the very first batch of data
+batch = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
@@ -405,17 +356,11 @@ while True:
             orig_model.state_dict(),
             optimizer.state_dict(),
             {
+                "model_type": "t5",
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                },
+                "model_config": asdict(orig_model.config),
+                "tokenizer_fingerprint": get_tokenizer_fingerprint(tokenizer),
                 "user_config": user_config, # inputs to the training script
             },
             rank=ddp_rank,
@@ -430,14 +375,14 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(**batch)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        batch = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)

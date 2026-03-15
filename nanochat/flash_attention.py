@@ -1,17 +1,9 @@
 """
 Unified Flash Attention interface with automatic FA3/SDPA switching.
 
-Exports `flash_attn` module that matches the FA3 API exactly, but falls back
-to PyTorch SDPA on non-Hopper GPUs (including Blackwell), MPS, and CPU.
-
-Usage (drop-in replacement for FA3):
-    from nanochat.flash_attention import flash_attn
-
-    # Training (no KV cache)
-    y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-
-    # Inference (with KV cache)
-    y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
+Exports `flash_attn` with the small API surface we use in the repo, while
+falling back to PyTorch SDPA when FA3 cannot represent the requested masking
+or bias semantics.
 """
 import torch
 import torch.nn.functional as F
@@ -66,45 +58,64 @@ USE_FA3 = _resolve_use_fa3()
 # =============================================================================
 # SDPA helpers
 # =============================================================================
-def _sdpa_attention(q, k, v, window_size, enable_gqa):
+def _to_additive_mask(mask, dtype):
+    if mask is None:
+        return None
+    if mask.dtype == torch.bool:
+        zeros = torch.zeros((), dtype=dtype, device=mask.device)
+        neg = torch.full((), torch.finfo(dtype).min, dtype=dtype, device=mask.device)
+        return torch.where(mask, zeros, neg)
+    return mask.to(dtype=dtype)
+
+
+def _build_structural_mask(Tq, Tk, device, causal, window_size):
+    left, right = window_size
+    if not causal and left < 0 and right < 0:
+        return None
+
+    q_idx = torch.arange(Tq, device=device).unsqueeze(1)
+    k_idx = torch.arange(Tk, device=device).unsqueeze(0)
+    if causal:
+        q_idx = q_idx + (Tk - Tq)
+        mask = k_idx <= q_idx
+    else:
+        mask = torch.ones(Tq, Tk, dtype=torch.bool, device=device)
+    if left >= 0:
+        mask = mask & ((q_idx - k_idx) <= left)
+    if right >= 0:
+        mask = mask & ((k_idx - q_idx) <= right)
+    return mask
+
+
+def _sdpa_attention(q, k, v, causal=False, window_size=(-1, -1), attn_mask=None, attn_bias=None, dropout_p=0.0):
     """
-    SDPA attention with sliding window support.
+    SDPA attention with causal/bidirectional masking, sliding windows,
+    additive attention bias, and key padding masks.
+
     q, k, v are (B, H, T, D) format.
     """
     Tq = q.size(2)
     Tk = k.size(2)
-    window = window_size[0]
+    enable_gqa = q.size(1) != k.size(1)
+    structural_mask = _build_structural_mask(Tq, Tk, q.device, causal, window_size)
 
-    # Full context, same length
-    if (window < 0 or window >= Tq) and Tq == Tk:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+    if structural_mask is None and attn_mask is None and attn_bias is None:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=causal, dropout_p=dropout_p, enable_gqa=enable_gqa)
 
-    # Single token generation
-    if Tq == 1:
-        if window >= 0 and window < Tk:
-            # window is "left" tokens we need to include (window + 1) keys total
-            start = max(0, Tk - (window + 1))
-            k = k[:, :, start:, :]
-            v = v[:, :, start:, :]
-        return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+    additive_mask = _to_additive_mask(structural_mask, q.dtype)
+    user_mask = _to_additive_mask(attn_mask, q.dtype)
+    if user_mask is not None:
+        additive_mask = user_mask if additive_mask is None else additive_mask + user_mask
+    if attn_bias is not None:
+        bias = attn_bias.to(dtype=q.dtype)
+        additive_mask = bias if additive_mask is None else additive_mask + bias
 
-    # Need explicit mask for sliding window/chunk inference
-    device = q.device
-    # For chunk inference (Tq != Tk), is_causal is not aligned to cache position => build an explicit bool mask
-    row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
-    col_idx = torch.arange(Tk, device=device).unsqueeze(0)
-    mask = col_idx <= row_idx
-
-    # sliding window (left)
-    if window >= 0 and window < Tk:
-        mask = mask & ((row_idx - col_idx) <= window)
-
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=additive_mask, dropout_p=dropout_p, enable_gqa=enable_gqa)
 
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), attn_mask=None, attn_bias=None, dropout_p=0.0):
     """
     Flash Attention for training (no KV cache).
 
@@ -112,24 +123,36 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         q, k, v: Tensors of shape (B, T, H, D)
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        attn_mask: Optional key mask or additive mask, broadcastable to (B, H, Tq, Tk).
+        attn_bias: Optional additive attention bias, broadcastable to (B, H, Tq, Tk).
+        dropout_p: Attention dropout probability.
 
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if USE_FA3:
-        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    use_fa3 = USE_FA3 and attn_mask is None and attn_bias is None and q.size(1) == k.size(1) == v.size(1)
+    if use_fa3:
+        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size, dropout_p=dropout_p)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
-    enable_gqa = q.size(1) != k.size(1)
-    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
+    y = _sdpa_attention(
+        q,
+        k,
+        v,
+        causal=causal,
+        window_size=window_size,
+        attn_mask=attn_mask,
+        attn_bias=attn_bias,
+        dropout_p=dropout_p,
+    )
     return y.transpose(1, 2)  # back to (B, T, H, D)
 
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
-                            causal=False, window_size=(-1, -1)):
+                            causal=False, window_size=(-1, -1), attn_mask=None, attn_bias=None, dropout_p=0.0):
     """
     Flash Attention with KV cache for inference.
 
@@ -142,14 +165,18 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
         cache_seqlens: Current position in cache, shape (B,) int32
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        attn_mask: Optional key mask or additive mask, broadcastable to (B, H, Tq, Tk).
+        attn_bias: Optional additive attention bias, broadcastable to (B, H, Tq, Tk).
+        dropout_p: Attention dropout probability.
 
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    if USE_FA3:
+    use_fa3 = USE_FA3 and attn_mask is None and attn_bias is None
+    if use_fa3:
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
-            causal=causal, window_size=window_size
+            causal=causal, window_size=window_size, dropout_p=dropout_p
         )
 
     # SDPA fallback: manually manage KV cache
@@ -171,8 +198,16 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     k_sdpa = k_full.transpose(1, 2)
     v_sdpa = v_full.transpose(1, 2)
 
-    enable_gqa = q_sdpa.size(1) != k_sdpa.size(1)
-    y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size, enable_gqa)
+    y_sdpa = _sdpa_attention(
+        q_sdpa,
+        k_sdpa,
+        v_sdpa,
+        causal=causal,
+        window_size=window_size,
+        attn_mask=attn_mask,
+        attn_bias=attn_bias,
+        dropout_p=dropout_p,
+    )
 
     return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
 

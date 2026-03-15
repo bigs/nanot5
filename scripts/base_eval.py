@@ -35,7 +35,7 @@ from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir,
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from nanochat.dataloader import tokenizing_distributed_seq2seq_loader
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 
@@ -223,7 +223,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 
 def main():
     parser = argparse.ArgumentParser(description="Base model evaluation")
-    parser.add_argument('--eval', type=str, default='core,bpb,sample', help='Comma-separated evaluations to run: core,bpb,sample (default: all)')
+    parser.add_argument('--eval', type=str, default='bpb,sample', help='Comma-separated evaluations to run: core,bpb,sample (default: bpb,sample)')
     parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path (e.g. openai-community/gpt2-xl)')
     parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag to identify the checkpoint directory')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
@@ -246,11 +246,7 @@ def main():
     # Load model and tokenizer
     is_hf_model = args.hf_path is not None
     if is_hf_model:
-        model, tokenizer = load_hf_model(args.hf_path, device)
-        sequence_len = model.max_seq_len or 1024
-        token_bytes = get_hf_token_bytes(tokenizer, device=device)
-        model_name = args.hf_path
-        model_slug = args.hf_path.replace("/", "-")
+        raise RuntimeError("HuggingFace causal-LM evaluation is not integrated with the repo's T5-only seq2seq path")
     else:
         model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
         sequence_len = meta["model_config"]["sequence_len"]
@@ -316,32 +312,14 @@ def main():
         steps = args.split_tokens // tokens_per_step
 
         for split_name in ["train", "val"]:
-            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+            loader = tokenizing_distributed_seq2seq_loader(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
             bpb = evaluate_bpb(model, loader, steps, token_bytes)
             bpb_results[split_name] = bpb
             print0(f"{split_name} bpb: {bpb:.6f}")
 
     # --- CORE evaluation ---
     if 'core' in eval_modes:
-        print0("\n" + "="*80)
-        print0("CORE Evaluation")
-        print0("="*80)
-        core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task)
-
-        # Write CSV output
-        if ddp_rank == 0:
-            base_dir = get_base_dir()
-            output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
-            os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
-            with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
-                f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
-                for label in core_results["results"]:
-                    acc = core_results["results"][label]
-                    centered = core_results["centered_results"][label]
-                    f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}\n")
-                f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}\n")
-            print0(f"\nResults written to: {output_csv_path}")
-            print0(f"CORE metric: {core_results['core_metric']:.4f}")
+        raise RuntimeError("CORE evaluation is still decoder-only and has not been integrated for T5 yet")
 
     # --- Log to report ---
     from nanochat.report import get_report

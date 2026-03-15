@@ -5,6 +5,14 @@ import math
 import torch
 import torch.distributed as dist
 
+def _batch_to_kwargs(batch):
+    if isinstance(batch, dict):
+        return batch
+    if isinstance(batch, tuple) and len(batch) == 2:
+        x, y = batch
+        return {"input_ids": x, "targets": y}
+    raise TypeError(f"Unsupported batch type for evaluate_bpb: {type(batch)}")
+
 @torch.no_grad()
 def evaluate_bpb(model, batches, steps, token_bytes):
     """
@@ -29,10 +37,11 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
     for _ in range(steps):
-        x, y = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none') # (B, T)
-        loss2d = loss2d.view(-1) # flatten
-        y = y.view(-1) # flatten
+        batch_kwargs = _batch_to_kwargs(next(batch_iter))
+        targets = batch_kwargs["targets"]
+        loss2d = model(**batch_kwargs, loss_reduction='none')
+        loss2d = loss2d.view(-1)
+        y = targets.view(-1)
         if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32
             # slightly more complex code path if some target tokens are ignore_index (e.g. -1)
             # any target token < 0 is to be ignored: do NOT index token_bytes with negatives

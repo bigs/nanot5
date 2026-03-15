@@ -183,7 +183,7 @@ def validate_chat_request(request: ChatRequest):
 
     # Validate role values
     for i, message in enumerate(request.messages):
-        if message.role not in ["user", "assistant"]:
+        if message.role not in ["user", "assistant", "system"]:
             raise HTTPException(
                 status_code=400,
                 detail=f"Message {i} has invalid role. Must be 'user', 'assistant', or 'system'"

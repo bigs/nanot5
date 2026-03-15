@@ -9,8 +9,8 @@ import logging
 import torch
 
 from nanochat.common import get_base_dir
-from nanochat.gpt import GPT, GPTConfig
-from nanochat.tokenizer import get_tokenizer
+from nanochat.t5 import T5, T5Config
+from nanochat.tokenizer import get_tokenizer, get_tokenizer_fingerprint
 from nanochat.common import setup_default_logging
 
 # Set up logging
@@ -20,24 +20,38 @@ def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
 
-def _patch_missing_config_keys(model_config_kwargs):
-    """Add default values for new config keys missing in old checkpoints."""
-    # Old models were trained with full context (no sliding window)
-    if "window_pattern" not in model_config_kwargs:
-        model_config_kwargs["window_pattern"] = "L"
-        log0(f"Patching missing window_pattern in model config to 'L'")
+def _require_t5_checkpoint(meta_data):
+    model_type = meta_data.get("model_type")
+    if model_type == "t5":
+        return
+    legacy_hint = "window_pattern" in meta_data.get("model_config", {})
+    if model_type == "gpt" or legacy_hint or model_type is None:
+        raise ValueError(
+            "Legacy GPT checkpoints are no longer supported in this repo. "
+            "Load a T5 checkpoint or retrain from a T5 base model."
+        )
+    raise ValueError(f"Unsupported checkpoint model_type={model_type!r}; expected 't5'")
 
-def _patch_missing_keys(model_data, model_config):
-    """Add default values for new parameters that may be missing in old checkpoints."""
-    n_layer = model_config.n_layer
-    # resid_lambdas defaults to 1.0 (identity scaling)
-    if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
-        log0(f"Patching missing resid_lambdas in model data to 1.0")
-    # x0_lambdas defaults to 0.0 (disabled)
-    if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
-        log0(f"Patching missing x0_lambdas in model data to 0.0")
+
+def _require_tokenizer_compatibility(meta_data, tokenizer, model_config_kwargs):
+    checkpoint_vocab_size = model_config_kwargs["vocab_size"]
+    tokenizer_vocab_size = tokenizer.get_vocab_size()
+    if tokenizer_vocab_size != checkpoint_vocab_size:
+        raise ValueError(
+            f"Tokenizer vocab size {tokenizer_vocab_size} does not match checkpoint vocab size {checkpoint_vocab_size}"
+        )
+    checkpoint_fingerprint = meta_data.get("tokenizer_fingerprint")
+    if checkpoint_fingerprint is None:
+        raise ValueError(
+            "Checkpoint predates tokenizer fingerprinting and is no longer supported. "
+            "Please regenerate the checkpoint with the current T5 tokenizer."
+        )
+    runtime_fingerprint = get_tokenizer_fingerprint(tokenizer)
+    if runtime_fingerprint != checkpoint_fingerprint:
+        raise ValueError(
+            "Tokenizer fingerprint mismatch between checkpoint and runtime tokenizer. "
+            f"checkpoint={checkpoint_fingerprint} runtime={runtime_fingerprint}"
+        )
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -93,15 +107,14 @@ def build_model(checkpoint_dir, step, device, phase):
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
-    _patch_missing_config_keys(model_config_kwargs)
+    _require_t5_checkpoint(meta_data)
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    _patch_missing_keys(model_data, model_config)
+    model_config = T5Config(**model_config_kwargs)
     with torch.device("meta"):
-        model = GPT(model_config)
+        model = T5(model_config)
     # Load the model state
     model.to_empty(device=device)
-    model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    model.init_weights() # initialize buffers/untied heads before state assignment
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
@@ -110,8 +123,7 @@ def build_model(checkpoint_dir, step, device, phase):
         model.train()
     # Load the Tokenizer
     tokenizer = get_tokenizer()
-    # Sanity check: compatibility between model and tokenizer
-    assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model_config_kwargs['vocab_size']}"
+    _require_tokenizer_compatibility(meta_data, tokenizer, model_config_kwargs)
     return model, tokenizer, meta_data
 
 
