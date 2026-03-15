@@ -1,4 +1,6 @@
-# nanochat
+# nanot5
+
+Note: nanot5 is a fork of karpathy/nanochat focused on adding T5 architecture support to nanochat.
 
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
