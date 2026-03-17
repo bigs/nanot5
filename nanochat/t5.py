@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import COMPUTE_DTYPE, get_dist_info, print0
+import nanochat.flash_attention as flash_attention_module
 from nanochat.flash_attention import flash_attn
 from nanochat.optim import DistMuonAdamW, MuonAdamW
 
@@ -167,7 +168,11 @@ class Attention(nn.Module):
                 v = torch.cat([past_v, v], dim=1)
 
         present_key_value = (k, v) if use_cache else None
-        key_mask = None if attention_mask is None else attention_mask[:, None, None, :]
+        key_mask = None
+        if attention_mask is not None:
+            mask_is_dense = attention_mask.to(torch.bool).all()
+            if not mask_is_dense:
+                key_mask = attention_mask[:, None, None, :]
         y = flash_attn.flash_attn_func(
             q,
             k,
@@ -176,6 +181,7 @@ class Attention(nn.Module):
             attn_mask=key_mask,
             attn_bias=position_bias,
             dropout_p=self.dropout if self.training else 0.0,
+            require_selected_backend=flash_attention_module.FAST_ATTN_BACKEND is not None,
         )
         y = y.contiguous().view(B, T, self.n_embd)
         y = self.c_proj(y)

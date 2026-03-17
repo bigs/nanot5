@@ -21,9 +21,9 @@ from nanochat.engine import KVCache
 
 
 def set_impl(impl):
-    """Set the implementation override ('fa3', 'sdpa', or None for auto) and re-resolve USE_FA3."""
+    """Set the implementation override ('fa3', 'fa4', 'sdpa', or None for auto)."""
     fa_module._override_impl = impl
-    fa_module.USE_FA3 = fa_module._resolve_use_fa3()
+    fa_module._refresh_fast_attention_state()
 
 
 def run_both_impls(fn):

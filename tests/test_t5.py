@@ -1,7 +1,8 @@
 import torch
 from torch.testing import assert_close
 
-from nanochat.t5 import T5, T5Config
+import nanochat.t5 as t5_module
+from nanochat.t5 import Attention, T5, T5Config
 
 
 def test_t5_config_defaults_to_13_layers_per_stack():
@@ -32,6 +33,37 @@ def build_model(tie_word_embeddings=True):
     model = T5(config)
     model.init_weights()
     return model
+
+
+def test_t5_attention_requires_selected_backend_when_fast_attention_is_active(monkeypatch):
+    config = T5Config(
+        sequence_len=8,
+        encoder_sequence_len=8,
+        decoder_sequence_len=8,
+        vocab_size=32,
+        n_layer=1,
+        n_head=4,
+        n_kv_head=2,
+        n_embd=16,
+        ff_hidden_size=32,
+        dropout=0.0,
+    )
+    attn = Attention(config)
+    calls = []
+
+    def fake_flash_attn_func(q, k, v, **kwargs):
+        calls.append(kwargs)
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(t5_module.flash_attention_module, "FAST_ATTN_BACKEND", "fa4")
+    monkeypatch.setattr(t5_module.flash_attn, "flash_attn_func", fake_flash_attn_func)
+
+    x = torch.randn(2, 4, config.n_embd)
+    position_bias = torch.randn(1, config.n_head, 4, 4)
+
+    attn(x, position_bias=position_bias)
+
+    assert calls[0]["require_selected_backend"] is True
 
 
 def test_t5_forward_loss():

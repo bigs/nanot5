@@ -1,0 +1,25 @@
+===== d24_bf16 =====
+2026-03-18 19:53:29,818 - nanochat.common - [32m[1mINFO[0m - Distributed world size: 1
+Traceback (most recent call last):
+  File "/root/.local/share/uv/python/cpython-3.10.20-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/root/.local/share/uv/python/cpython-3.10.20-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/workspace/nanot5/scripts/base_train.py", line 128, in <module>
+    token_bytes = get_token_bytes(device=device)
+  File "/workspace/nanot5/nanochat/tokenizer.py", line 336, in get_token_bytes
+    assert os.path.exists(token_bytes_path), f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py"
+AssertionError: Token bytes not found at /workspace/nanochat-cache/tokenizer/token_bytes.pt? It gets written by tok_train.py
+
+                                                       █████                █████
+                                                      ░░███                ░░███
+     ████████    ██████   ████████    ██████   ██████  ░███████    ██████  ███████
+    ░░███░░███  ░░░░░███ ░░███░░███  ███░░███ ███░░███ ░███░░███  ░░░░░███░░░███░
+     ░███ ░███   ███████  ░███ ░███ ░███ ░███░███ ░░░  ░███ ░███   ███████  ░███
+     ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
+     ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
+    ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
+    
+GPU: NVIDIA B200 | Peak FLOPS (BF16): 2.25e+15
+COMPUTE_DTYPE: torch.bfloat16 (auto-detected: CUDA SM 100 (bf16 supported))
+✓ Using FlashAttention-4 fast path (Blackwell GPU detected).

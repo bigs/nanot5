@@ -22,7 +22,7 @@ from nanochat.tokenizer import get_token_bytes, get_tokenizer_fingerprint
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import USE_FAST_ATTENTION
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
@@ -90,8 +90,8 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
 # Flash Attention status
-if not HAS_FA3:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
+if not USE_FAST_ATTENTION:
+    print0("WARNING: No compatible Flash Attention fast path is active, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)

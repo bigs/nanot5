@@ -1,0 +1,72 @@
+
+                                                       █████                █████
+                                                      ░░███                ░░███
+     ████████    ██████   ████████    ██████   ██████  ░███████    ██████  ███████
+    ░░███░░███  ░░░░░███ ░░███░░███  ███░░███ ███░░███ ░███░░███  ░░░░░███░░░███░
+     ░███ ░███   ███████  ░███ ░███ ░███ ░███░███ ░░░  ░███ ░███   ███████  ░███
+     ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
+     ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
+    ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
+    
+2026-03-18 04:54:31,378 - nanochat.common - [32m[1mINFO[0m - Distributed world size: 1
+GPU: NVIDIA B200 | Peak FLOPS (BF16): 2.25e+15
+COMPUTE_DTYPE: torch.bfloat16 (auto-detected: CUDA SM 100 (bf16 supported))
+✓ Using FlashAttention-4 fast path (Blackwell GPU detected).
+Vocab size: 32,768
+Model config:
+{
+  "sequence_len": 2048,
+  "encoder_sequence_len": 2048,
+  "decoder_sequence_len": 2048,
+  "vocab_size": 32768,
+  "n_layer": 13,
+  "n_encoder_layer": 13,
+  "n_decoder_layer": 13,
+  "n_head": 7,
+  "n_kv_head": 7,
+  "n_embd": 896,
+  "ff_mult": 4.0,
+  "ff_hidden_size": 3584,
+  "feed_forward": "gated-gelu",
+  "relative_attention_num_buckets": 32,
+  "relative_attention_max_distance": 128,
+  "dropout": 0.0,
+  "tie_word_embeddings": true,
+  "pad_token_id": 0,
+  "eos_token_id": 1,
+  "layer_norm_epsilon": 1e-06
+}
+✓ FP8 training enabled (tensorwise scaling) - converted 234/234 linear layers, skipped 0 (too small)
+Parameter counts:
+shared                  : 29,360,128
+lm_head                 : 0
+encoder                 : 167,009,920
+decoder                 : 208,768,000
+relative_attention_bias : 448
+total                   : 405,138,496
+Estimated FLOPs per token: 3.113454e+09
+Auto-computed optimal batch size: 524,288 tokens
+Scaling weight decay from 0.280000 to 0.193526 for depth 13
+Scaling the LR for the AdamW parameters ∝1/√(896/768) = 0.925820
+Using user-provided number of iterations: 10
+Total number of training tokens: 5,242,880
+Tokens : Scaling params ratio: 0.01
+Total training FLOPs estimate: 1.632347e+16
+Tokens / micro-batch / rank: 2 x 2048 = 4,096
+Tokens / micro-batch: 4,096
+Total batch size 524,288 => gradient accumulation steps: 128
+step 00000/00010 (0.00%) | loss: 721.514648 | lrm: 0.03 | dt: 122417.60ms | tok/sec: 4,282 | bf16_mfu: 0.59 | epoch: 1 pq: 0 rg: 0 | total time: 0.00m
+step 00001/00010 (10.00%) | loss: 710.517302 | lrm: 0.05 | dt: 16969.14ms | tok/sec: 30,896 | bf16_mfu: 4.28 | epoch: 1 pq: 0 rg: 0 | total time: 0.00m
+step 00002/00010 (20.00%) | loss: 696.626208 | lrm: 0.07 | dt: 17015.89ms | tok/sec: 30,811 | bf16_mfu: 4.26 | epoch: 1 pq: 0 rg: 0 | total time: 0.00m
+step 00003/00010 (30.00%) | loss: 680.251113 | lrm: 0.10 | dt: 16826.05ms | tok/sec: 31,159 | bf16_mfu: 4.31 | epoch: 1 pq: 0 rg: 0 | total time: 0.00m
+step 00004/00010 (40.00%) | loss: 657.858610 | lrm: 0.12 | dt: 16980.65ms | tok/sec: 30,875 | bf16_mfu: 4.27 | epoch: 1 pq: 0 rg: 0 | total time: 0.00m
+step 00005/00010 (50.00%) | loss: 630.233936 | lrm: 0.15 | dt: 17000.83ms | tok/sec: 30,838 | bf16_mfu: 4.27 | epoch: 1 pq: 0 rg: 0 | total time: 0.00m
+step 00006/00010 (60.00%) | loss: 596.604861 | lrm: 0.17 | dt: 16573.71ms | tok/sec: 31,633 | bf16_mfu: 4.38 | epoch: 1 pq: 0 rg: 0 | total time: 0.00m
+step 00007/00010 (70.00%) | loss: 558.899357 | lrm: 0.20 | dt: 16431.43ms | tok/sec: 31,907 | bf16_mfu: 4.42 | epoch: 1 pq: 0 rg: 0 | total time: 0.00m
+step 00008/00010 (80.00%) | loss: 514.177433 | lrm: 0.23 | dt: 16500.40ms | tok/sec: 31,774 | bf16_mfu: 4.40 | epoch: 1 pq: 0 rg: 0 | total time: 0.00m
+step 00009/00010 (90.00%) | loss: 465.076495 | lrm: 0.25 | dt: 17008.58ms | tok/sec: 30,824 | bf16_mfu: 4.27 | epoch: 1 pq: 0 rg: 0 | total time: 0.00m
+2026-03-18 04:59:08,907 - nanochat.checkpoint_manager - [32m[1mINFO[0m - Saved model parameters to: /workspace/nanochat-cache/base_checkpoints/d13/model_000010.pt
+2026-03-18 04:59:08,908 - nanochat.checkpoint_manager - [32m[1mINFO[0m - Saved metadata to: /workspace/nanochat-cache/base_checkpoints/d13/meta_000010.json
+2026-03-18 04:59:10,768 - nanochat.checkpoint_manager - [32m[1mINFO[0m - Saved optimizer state to: /workspace/nanochat-cache/base_checkpoints/d13/optim_000010_rank0.pt
+Peak memory usage: 16772.28MiB
+Total training time: 0.00m
