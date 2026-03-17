@@ -46,6 +46,12 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+parser.add_argument("--fp8-opaque-autograd", action=argparse.BooleanOptionalAction, default=True, help="treat the FP8 autograd.Function as an opaque torch.compile node (disable for compile ablations)")
+parser.add_argument("--fp8-forward-fast-accum", action=argparse.BooleanOptionalAction, default=True, help="use fast accumulation for the FP8 forward GEMM")
+parser.add_argument("--fp8-grad-input-fast-accum", action=argparse.BooleanOptionalAction, default=False, help="use fast accumulation for the FP8 grad_input GEMM")
+parser.add_argument("--fp8-grad-weight-fast-accum", action=argparse.BooleanOptionalAction, default=False, help="use fast accumulation for the FP8 grad_weight GEMM")
+parser.add_argument("--fp8-fix-grad-input-layout", action=argparse.BooleanOptionalAction, default=True, help="apply layout-fix copies for the FP8 grad_input GEMM")
+parser.add_argument("--fp8-fix-grad-weight-layout", action=argparse.BooleanOptionalAction, default=True, help="apply layout-fix copies for the FP8 grad_weight GEMM")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -191,7 +197,25 @@ if args.fp8:
                 return False
             return True
 
-        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+        fp8_recipe_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+        fp8_config = Float8LinearConfig(
+            opaque_autograd=args.fp8_opaque_autograd,
+            forward_fast_accum=args.fp8_forward_fast_accum,
+            grad_input_fast_accum=args.fp8_grad_input_fast_accum,
+            grad_weight_fast_accum=args.fp8_grad_weight_fast_accum,
+            fix_grad_input_layout=args.fp8_fix_grad_input_layout,
+            fix_grad_weight_layout=args.fp8_fix_grad_weight_layout,
+        )
+        if fp8_config != fp8_recipe_config:
+            print0(
+                "FP8 ablations: "
+                f"opaque_autograd={int(fp8_config.opaque_autograd)} "
+                f"forward_fast_accum={int(fp8_config.forward_fast_accum)} "
+                f"grad_input_fast_accum={int(fp8_config.grad_input_fast_accum)} "
+                f"grad_weight_fast_accum={int(fp8_config.grad_weight_fast_accum)} "
+                f"fix_grad_input_layout={int(fp8_config.fix_grad_input_layout)} "
+                f"fix_grad_weight_layout={int(fp8_config.fix_grad_weight_layout)}"
+            )
         num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
         convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
         num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
